@@ -49,7 +49,7 @@ def validate_snapshot(
     timestamp_column: str,
     label: str,
 ) -> pd.DataFrame:
-    """TODO 1: Implementér den fatale datakontrakt.
+    """Modul02: implementér den fatale datakontrakt.
 
     Minimum:
     - kontrollér obligatoriske kolonner;
@@ -104,7 +104,7 @@ def validate_snapshot(
 
 
 def mw_to_mwh(values: pd.Series, interval_minutes: int = 5) -> pd.Series:
-    """TODO 2: Beregn MWh som MW × interval_minutes/60.
+    """Modul02: beregn MWh som MW × interval_minutes/60.
 
     Caseantagelse: MW repræsenterer det efterfølgende interval; se DATAORDLISTE.md.
     Resultatet er et tilnærmet sammenligningsgrundlag, ikke officiel afregning.
@@ -116,7 +116,7 @@ def mw_to_mwh(values: pd.Series, interval_minutes: int = 5) -> pd.Series:
 
 
 def prepare_realtime(frame: pd.DataFrame) -> pd.DataFrame:
-    """TODO 3: Skab én realtime-række pr. UTC-time og prisområde.
+    """Modul02: skab én realtime-række pr. UTC-time og prisområde.
 
     Outputtet skal mindst indeholde:
     - hour_utc, price_area og rt_interval_count;
@@ -214,35 +214,230 @@ def prepare_realtime(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_settlement(frame: pd.DataFrame) -> pd.DataFrame:
-    """TODO 4: Skab sammenligningsfelter i afregningsdata.
+    """Modul03: skab sammenlignelige felter i afregningsdata.
 
-    Outputtet skal mindst indeholde:
-    - hour_utc, hour_dk og price_area;
-    - samlet offshore og onshore;
-    - sol både uden og med self-consumption;
-    - udenlandsk udveksling uden Storebælt;
-    - gross consumption.
+    Outputtet har samme grain som realtime-aggregatet: én UTC-time pr.
+    prisområde. Storebælt holdes ude af udenlandsk udveksling, fordi
+    forbindelsen flytter energi mellem DK1 og DK2. Strukturelle nulls i
+    udenlandske forbindelser behandles som 0, mens øvrige måle-nullværdier
+    bevares.
     """
-    raise NextTodo("TODO 4 er ikke implementeret: prepare_settlement() Følg det aktuelle modul i OPGAVE.md.")
+    required = set(SETTLEMENT_REQUIRED_COLUMNS)
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"afregning: mangler kolonner til transformation: {missing}")
+
+    work = frame.copy()
+    if not isinstance(work["HourUTC"].dtype, pd.DatetimeTZDtype):
+        work["HourUTC"] = pd.to_datetime(work["HourUTC"], errors="raise", utc=True)
+    work["HourDK"] = pd.to_datetime(work["HourDK"], errors="raise")
+
+    offshore_columns = [
+        "OffshoreWindLt100MW_MWh",
+        "OffshoreWindGe100MW_MWh",
+    ]
+    onshore_columns = [
+        "OnshoreWindLt50kW_MWh",
+        "OnshoreWindGe50kW_MWh",
+    ]
+    solar_grid_columns = [
+        "SolarPowerLt10kW_MWh",
+        "SolarPowerGe10Lt40kW_MWh",
+        "SolarPowerGe40kW_MWh",
+    ]
+    exchange_columns = [
+        "ExchangeNO_MWh",
+        "ExchangeSE_MWh",
+        "ExchangeGE_MWh",
+        "ExchangeNL_MWh",
+        "ExchangeGB_MWh",
+    ]
+
+    offshore = work[offshore_columns].apply(pd.to_numeric, errors="raise")
+    onshore = work[onshore_columns].apply(pd.to_numeric, errors="raise")
+    solar_grid = work[solar_grid_columns].apply(pd.to_numeric, errors="raise")
+
+    # Null i en forbindelse, der fysisk ikke findes i prisområdet, er
+    # strukturel. Storebælt er bevidst ikke med i denne sum.
+    exchange = work[exchange_columns].apply(pd.to_numeric, errors="raise").fillna(0.0)
+
+    result = pd.DataFrame({
+        "hour_utc": work["HourUTC"],
+        "hour_dk": work["HourDK"],
+        "price_area": work["PriceArea"],
+        "st_offshore_wind_mwh": offshore.sum(
+            axis=1, min_count=len(offshore_columns)
+        ),
+        "st_onshore_wind_mwh": onshore.sum(
+            axis=1, min_count=len(onshore_columns)
+        ),
+        "st_solar_grid_mwh": solar_grid.sum(
+            axis=1, min_count=len(solar_grid_columns)
+        ),
+        "st_external_exchange_mwh": exchange.sum(axis=1),
+        "st_gross_consumption_mwh": pd.to_numeric(
+            work["GrossConsumptionMWh"], errors="raise"
+        ),
+    })
+
+    solar_self = pd.to_numeric(work["SolarPowerSelfConMWh"], errors="raise")
+    result["st_solar_all_mwh"] = result["st_solar_grid_mwh"] + solar_self
+
+    duplicate = result.duplicated(subset=["hour_utc", "price_area"], keep=False)
+    if duplicate.any():
+        bad = result.loc[duplicate, ["hour_utc", "price_area"]]
+        raise ValueError(
+            "afregning: dublet efter transformation på (hour_utc, price_area):\n"
+            + bad.to_string(index=False)
+        )
+
+    return result.sort_values(["hour_utc", "price_area"]).reset_index(drop=True)
 
 
 def join_and_flag(realtime: pd.DataFrame, settlement: pd.DataFrame) -> pd.DataFrame:
-    """TODO 5: Udfør outer join og tilføj kvalitetsflag.
+    """Modul03: outer join kilderne og bevar synlige kvalitetsflag.
 
-    Brug hour_utc + price_area som join key, og validér én-til-én-kardinalitet.
-    Bevar mindst flag for joinstatus og præcis 12 realtime-intervaller.
-    Tilføj gerne negative værdier, frosne tilstande og metadataadvarsler.
+    Joinet valideres som one-to-one på ``hour_utc + price_area``. Rækker
+    slettes ikke, når der findes problemer; i stedet registreres joinstatus,
+    intervaldækning, negative realtime-produktionsværdier og læsbare
+    issue-koder.
     """
-    raise NextTodo("TODO 5 er ikke implementeret: join_and_flag() Følg det aktuelle modul i OPGAVE.md.")
+    join_key = ["hour_utc", "price_area"]
+
+    for label, frame in (("realtime", realtime), ("afregning", settlement)):
+        missing = sorted(set(join_key) - set(frame.columns))
+        if missing:
+            raise ValueError(f"{label}: mangler join-kolonner: {missing}")
+        if frame[join_key].isna().any().any():
+            raise ValueError(f"{label}: join key indeholder manglende værdier.")
+        duplicate = frame.duplicated(subset=join_key, keep=False)
+        if duplicate.any():
+            bad = frame.loc[duplicate, join_key]
+            raise ValueError(
+                f"{label}: join key er ikke entydig:\n{bad.to_string(index=False)}"
+            )
+
+    result = realtime.merge(
+        settlement,
+        on=join_key,
+        how="outer",
+        validate="one_to_one",
+        indicator=True,
+        sort=True,
+    )
+
+    join_status = result["_merge"].map({
+        "both": "matched",
+        "left_only": "realtime_only",
+        "right_only": "settlement_only",
+    })
+    # map() på en kategorisk merge-indikator kan bevare kategorisk dtype;
+    # string gør outputtet enklere at skrive og tælle.
+    result["quality_join_status"] = join_status.astype("string")
+    result["quality_join_matched"] = result["_merge"].eq("both")
+
+    realtime_present = result["_merge"].ne("right_only")
+    result["quality_rt_complete_hour"] = (
+        realtime_present
+        & result["rt_interval_count"].eq(EXPECTED_INTERVALS_PER_HOUR)
+    )
+    result["quality_rt_negative_production"] = (
+        result["rt_negative_production_intervals"].fillna(0).gt(0)
+    )
+
+    # Hvis en række kun findes i realtime, kan dansk lokaltid stadig afledes
+    # entydigt fra UTC. Det gør outer-join-rækker lettere at undersøge.
+    if "hour_dk" in result.columns:
+        missing_hour_dk = result["hour_dk"].isna() & result["hour_utc"].notna()
+        if missing_hour_dk.any():
+            local_time = (
+                result.loc[missing_hour_dk, "hour_utc"]
+                .dt.tz_convert("Europe/Copenhagen")
+                .dt.tz_localize(None)
+            )
+            result.loc[missing_hour_dk, "hour_dk"] = local_time
+
+    def issue_codes(row: pd.Series) -> str:
+        issues: list[str] = []
+        status = row["quality_join_status"]
+        if status == "realtime_only":
+            issues.append("MISSING_SETTLEMENT")
+        elif status == "settlement_only":
+            issues.append("MISSING_REALTIME")
+
+        if status != "settlement_only" and not bool(row["quality_rt_complete_hour"]):
+            issues.append("RT_INCOMPLETE_HOUR")
+        if bool(row["quality_rt_negative_production"]):
+            issues.append("RT_NEGATIVE_PRODUCTION")
+        return ";".join(issues) if issues else "OK"
+
+    result["quality_issue_codes"] = result.apply(issue_codes, axis=1)
+
+    # Direkte differencer gør de centrale sammenligninger analyseklare.
+    comparison_pairs = {
+        "diff_offshore_wind_mwh": ("rt_offshore_wind_mwh", "st_offshore_wind_mwh"),
+        "diff_onshore_wind_mwh": ("rt_onshore_wind_mwh", "st_onshore_wind_mwh"),
+        "diff_solar_grid_mwh": ("rt_solar_mwh", "st_solar_grid_mwh"),
+        "diff_solar_all_mwh": ("rt_solar_mwh", "st_solar_all_mwh"),
+        "diff_external_exchange_mwh": ("rt_external_exchange_mwh", "st_external_exchange_mwh"),
+        "diff_load_mwh": ("rt_load_balance_mwh", "st_gross_consumption_mwh"),
+    }
+    for output_column, (rt_column, st_column) in comparison_pairs.items():
+        result[output_column] = result[rt_column] - result[st_column]
+
+    result = result.drop(columns=["_merge"])
+    return result.sort_values(join_key).reset_index(drop=True)
 
 
 def create_quality_summary(analysis_ready: pd.DataFrame) -> dict:
-    """TODO 6: Lav en lille maskinlæsbar rapport med tællinger.
+    """Modul03: lav en maskinlæsbar kvalitetsrapport med tællinger."""
+    required = {
+        "quality_join_status",
+        "quality_join_matched",
+        "quality_rt_complete_hour",
+        "quality_rt_negative_production",
+        "quality_issue_codes",
+        "rt_interval_count",
+    }
+    missing = sorted(required - set(analysis_ready.columns))
+    if missing:
+        raise ValueError(f"Kvalitetsrapport mangler kolonner: {missing}")
 
-    Medtag mindst samlet rækkeantal, joinstatus, fulde/ufuldstændige timer
-    og antal rækker med hvert kvalitetsflag.
-    """
-    raise NextTodo("TODO 6 er ikke implementeret: create_quality_summary() Følg det aktuelle modul i OPGAVE.md.")
+    join_counts = analysis_ready["quality_join_status"].value_counts(dropna=False)
+    realtime_present = analysis_ready["quality_join_status"].ne("settlement_only")
+    complete = realtime_present & analysis_ready["quality_rt_complete_hour"]
+    incomplete = realtime_present & ~analysis_ready["quality_rt_complete_hour"]
+
+    issue_count: dict[str, int] = {}
+    for value in analysis_ready["quality_issue_codes"].fillna(""):
+        for code in str(value).split(";"):
+            code = code.strip()
+            if not code or code == "OK":
+                continue
+            issue_count[code] = issue_count.get(code, 0) + 1
+
+    return {
+        "total_rows": int(len(analysis_ready)),
+        "join_status_counts": {
+            "matched": int(join_counts.get("matched", 0)),
+            "realtime_only": int(join_counts.get("realtime_only", 0)),
+            "settlement_only": int(join_counts.get("settlement_only", 0)),
+        },
+        "realtime_hours": {
+            "complete": int(complete.sum()),
+            "incomplete": int(incomplete.sum()),
+            "missing_from_realtime": int((~realtime_present).sum()),
+            "expected_intervals_per_hour": int(EXPECTED_INTERVALS_PER_HOUR),
+        },
+        "quality_flag_counts": {
+            "join_unmatched": int((~analysis_ready["quality_join_matched"]).sum()),
+            "rt_incomplete_hour": int(incomplete.sum()),
+            "rt_negative_production": int(
+                analysis_ready["quality_rt_negative_production"].sum()
+            ),
+        },
+        "issue_code_counts": dict(sorted(issue_count.items())),
+    }
 
 
 def write_outputs(
