@@ -58,7 +58,49 @@ def validate_snapshot(
     - kontrollér dubletter på den sammensatte primærnøgle: timestamp + PriceArea;
     - returnér en kopi med den konverterede timestampkolonne.
     """
-    raise NextTodo("TODO 1 er ikke implementeret: validate_snapshot() Følg det aktuelle modul i OPGAVE.md.")
+    missing = sorted(set(required_columns) - set(frame.columns))
+    if missing:
+        raise ValueError(f"{label}: mangler obligatoriske kolonner: {missing}")
+
+    result = frame.copy()
+
+    try:
+        result[timestamp_column] = pd.to_datetime(
+            result[timestamp_column],
+            errors="raise",
+            utc=True,
+        )
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"{label}: ugyldig timestamp i {timestamp_column}."
+        ) from exc
+
+    if result[timestamp_column].isna().any():
+        raise ValueError(f"{label}: {timestamp_column} indeholder manglende timestamps.")
+
+    if "PriceArea" not in result.columns:
+        raise ValueError(f"{label}: PriceArea mangler.")
+
+    invalid_area = result["PriceArea"].isna() | ~result["PriceArea"].isin(EXPECTED_PRICE_AREAS)
+    if invalid_area.any():
+        values = sorted(result.loc[invalid_area, "PriceArea"].astype(str).unique().tolist())
+        raise ValueError(
+            f"{label}: uventede PriceArea-værdier: {values}; "
+            f"forventede {sorted(EXPECTED_PRICE_AREAS)}."
+        )
+
+    duplicate = result.duplicated(
+        subset=[timestamp_column, "PriceArea"],
+        keep=False,
+    )
+    if duplicate.any():
+        bad = result.loc[duplicate, [timestamp_column, "PriceArea"]]
+        raise ValueError(
+            f"{label}: dublet på sammensat primærnøgle "
+            f"({timestamp_column}, PriceArea):\n{bad.to_string(index=False)}"
+        )
+
+    return result
 
 
 def mw_to_mwh(values: pd.Series, interval_minutes: int = 5) -> pd.Series:
@@ -67,7 +109,10 @@ def mw_to_mwh(values: pd.Series, interval_minutes: int = 5) -> pd.Series:
     Caseantagelse: MW repræsenterer det efterfølgende interval; se DATAORDLISTE.md.
     Resultatet er et tilnærmet sammenligningsgrundlag, ikke officiel afregning.
     """
-    raise NextTodo("TODO 2 er ikke implementeret: mw_to_mwh() Følg det aktuelle modul i OPGAVE.md.")
+    if interval_minutes <= 0:
+        raise ValueError("interval_minutes skal være større end 0.")
+    numeric = pd.to_numeric(values, errors="raise")
+    return numeric * (interval_minutes / 60.0)
 
 
 def prepare_realtime(frame: pd.DataFrame) -> pd.DataFrame:
@@ -82,7 +127,90 @@ def prepare_realtime(frame: pd.DataFrame) -> pd.DataFrame:
 
     Husk at omregne hvert interval før summering.
     """
-    raise NextTodo("TODO 3 er ikke implementeret: prepare_realtime() Følg det aktuelle modul i OPGAVE.md.")
+    required = set(REALTIME_REQUIRED_COLUMNS)
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"realtime: mangler kolonner til aggregation: {missing}")
+
+    work = frame.copy()
+    if not isinstance(work["Minutes5UTC"].dtype, pd.DatetimeTZDtype):
+        work["Minutes5UTC"] = pd.to_datetime(
+            work["Minutes5UTC"], errors="raise", utc=True
+        )
+
+    # De tre produktionstyper, der sammenlignes direkte med afregningsdata.
+    work["_offshore_mwh"] = mw_to_mwh(work["OffshoreWindPower"])
+    work["_onshore_mwh"] = mw_to_mwh(work["OnshoreWindPower"])
+    work["_solar_mwh"] = mw_to_mwh(work["SolarPower"])
+
+    # Null i en fysisk ikke-eksisterende udvekslingsforbindelse er strukturel.
+    # Derfor behandles null som 0 kun i disse udvekslingskolonner.
+    exchange_columns = [
+        "ExchangeGermany",
+        "ExchangeNetherlands",
+        "ExchangeGreatBritain",
+        "ExchangeNorway",
+        "ExchangeSweden",
+    ]
+    exchange_mw = work[exchange_columns].apply(pd.to_numeric, errors="raise").fillna(0.0)
+    work["_external_exchange_mwh"] = mw_to_mwh(exchange_mw.sum(axis=1))
+
+    # Prisområdebalancen inkluderer Storebælt, fordi forbindelsen flytter energi
+    # mellem DK1 og DK2. BornholmSE4 lægges ikke til separat, da metadata siger,
+    # at den allerede indgår i ExchangeSweden.
+    production_columns = [
+        "ProductionLt100MW",
+        "ProductionGe100MW",
+        "OffshoreWindPower",
+        "OnshoreWindPower",
+        "SolarPower",
+    ]
+    production_mw = work[production_columns].apply(pd.to_numeric, errors="raise")
+    production_total_mw = production_mw.sum(axis=1, min_count=len(production_columns))
+    great_belt_mw = pd.to_numeric(work["ExchangeGreatBelt"], errors="raise")
+    work["_load_balance_mwh"] = mw_to_mwh(
+        production_total_mw + exchange_mw.sum(axis=1) + great_belt_mw
+    )
+
+    # Antal femminuttersrækker, hvor mindst én produktionsværdi er negativ.
+    work["_negative_production_interval"] = production_mw.lt(0).any(axis=1).astype(int)
+    work["hour_utc"] = work["Minutes5UTC"].dt.floor("h")
+    work["price_area"] = work["PriceArea"]
+
+    grouped = work.groupby(["hour_utc", "price_area"], as_index=False, sort=True)
+
+    totals = grouped[[
+        "_offshore_mwh",
+        "_onshore_mwh",
+        "_solar_mwh",
+        "_external_exchange_mwh",
+        "_load_balance_mwh",
+        "_negative_production_interval",
+    ]].sum(min_count=1)
+
+    counts = grouped.size().rename(columns={"size": "rt_interval_count"})
+    result = totals.merge(counts, on=["hour_utc", "price_area"], validate="1:1")
+
+    result = result.rename(columns={
+        "_offshore_mwh": "rt_offshore_wind_mwh",
+        "_onshore_mwh": "rt_onshore_wind_mwh",
+        "_solar_mwh": "rt_solar_mwh",
+        "_external_exchange_mwh": "rt_external_exchange_mwh",
+        "_load_balance_mwh": "rt_load_balance_mwh",
+        "_negative_production_interval": "rt_negative_production_intervals",
+    })
+
+    return result[[
+        "hour_utc",
+        "price_area",
+        "rt_interval_count",
+        "rt_offshore_wind_mwh",
+        "rt_onshore_wind_mwh",
+        "rt_solar_mwh",
+        "rt_external_exchange_mwh",
+        "rt_load_balance_mwh",
+        "rt_negative_production_intervals",
+    ]]
 
 
 def prepare_settlement(frame: pd.DataFrame) -> pd.DataFrame:
