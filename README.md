@@ -81,6 +81,14 @@ python -m pip install -r requirements.txt
 | `run_pipeline.py` | Kører din pipeline for en valgt periode |
 | `output/` | Her skriver du dine egne mellem- og slutfiler |
 
+## Dokumentation af de 3 valgte spørgsmål
+
+De valgte spørgsmål fra spørgsmålsbanken er **nr. 1, 3 og 5**. Den tekniske
+forklaring på, hvordan pipelinen producerer grundlaget for svarene, står øverst
+i `src/pipeline.py` under **"DOKUMENTATION: SÅDAN BESVARES DE 3 VALGTE SPØRGSMÅL"**.
+De konkrete beregnede resultater, observationer og konklusioner står i
+`docs/undersoegelser_og_ansvar.md`.
+
 ## Vigtige spilleregler
 
 - Redigér ikke filer i `data/raw/`.

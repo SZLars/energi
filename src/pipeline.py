@@ -20,6 +20,54 @@ RAW_DIR = PROJECT_ROOT / "data" / "raw"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 
 
+# DOKUMENTATION: SÅDAN BESVARES DE 3 VALGTE SPØRGSMÅL
+# De valgte spørgsmål er nr. 1, 3 og 5 fra spørgsmålsbanken i OPGAVE.md.
+# I docs/undersoegelser_og_ansvar.md kaldes de henholdsvis Undersøgelse 1, 2
+# og 3. Selve pipelinen producerer de analysekolonner og kvalitetsflag, som
+# bruges til svarene; de endelige tal og konklusioner står i dokumentationen.
+#
+# SPØRGSMÅLSBANK NR. 1 / UNDERSØGELSE 1
+# "Er realtime-data lige anvendelige i vinter og sommer?"
+#
+#   1. run_period("january") og run_period("june") laver hver sin
+#      analysis_ready_*.csv.
+#   2. join_and_flag() beregner diff_* som:
+#          realtime-værdi - afregningsværdi
+#   3. I analysen bruges kun rækker hvor:
+#          quality_join_matched == True
+#          quality_rt_complete_hour == True
+#   4. For hvert sammenligningsfelt beregnes:
+#          MAE = mean(abs(diff_*))
+#   5. Januar- og juni-MAE sammenlignes. create_quality_summary() bruges også
+#      til at sammenligne antal ufuldstændige timer og andre kvalitetsfund.
+#
+# SPØRGSMÅLSBANK NR. 3 / UNDERSØGELSE 2
+# "Er forskellen mellem realtime og afregning den samme i DK1 og DK2?"
+#
+#   1. Der bruges de samme diff_*-kolonner og det samme kvalitetsfilter som
+#      ovenfor.
+#   2. De godkendte rækker opdeles efter price_area (DK1 og DK2).
+#   3. MAE = mean(abs(diff_*)) beregnes separat for DK1 og DK2.
+#   4. De to prisområders MAE sammenlignes for januar og juni.
+#
+# SPØRGSMÅLSBANK NR. 5 / UNDERSØGELSE 3
+# "Hvad sker der, hvis ufuldstændige timer behandles som normale timer?"
+#
+#   1. prepare_realtime() tæller femminuttersintervaller i rt_interval_count.
+#   2. join_and_flag() sætter quality_rt_complete_hour = True kun når timen
+#      har præcis EXPECTED_INTERVALS_PER_HOUR (= 12) intervaller.
+#   3. Ufuldstændige timer bevares og får issue-koden RT_INCOMPLETE_HOUR.
+#   4. Analysen sammenligner load-MAE på tre måder:
+#          - alle matchede timer,
+#          - kun komplette timer,
+#          - kun ufuldstændige timer.
+#      Forskellen viser, hvor meget resultatet påvirkes, hvis ufuldstændige
+#      timer fejlagtigt behandles som normale.
+#
+# Se docs/undersoegelser_og_ansvar.md for de konkrete januar-/juni-tal,
+# eksempeltimer, observationer, begrænsninger og konklusioner.
+
+
 class NextTodo(NotImplementedError):
     """Markér et endnu ikke implementeret trin uden at styre modulrækkefølgen."""
 
@@ -188,6 +236,8 @@ def prepare_realtime(frame: pd.DataFrame) -> pd.DataFrame:
         "_negative_production_interval",
     ]].sum(min_count=1)
 
+    # Spørgsmålsbank nr. 5: rt_interval_count er grundlaget for at afgøre,
+    # om en time er komplet. En normal time forventes at indeholde 12 x 5 min.
     counts = grouped.size().rename(columns={"size": "rt_interval_count"})
     result = totals.merge(counts, on=["hour_utc", "price_area"], validate="1:1")
 
@@ -337,6 +387,9 @@ def join_and_flag(realtime: pd.DataFrame, settlement: pd.DataFrame) -> pd.DataFr
     result["quality_join_matched"] = result["_merge"].eq("both")
 
     realtime_present = result["_merge"].ne("right_only")
+    # Spørgsmålsbank nr. 5: dette flag gør det muligt at sammenligne MAE for
+    # alle timer med MAE for kun komplette timer. Ufuldstændige timer slettes
+    # ikke, fordi netop deres påvirkning på analysen skal kunne undersøges.
     result["quality_rt_complete_hour"] = (
         realtime_present
         & result["rt_interval_count"].eq(EXPECTED_INTERVALS_PER_HOUR)
@@ -373,7 +426,11 @@ def join_and_flag(realtime: pd.DataFrame, settlement: pd.DataFrame) -> pd.DataFr
 
     result["quality_issue_codes"] = result.apply(issue_codes, axis=1)
 
-    # Direkte differencer gør de centrale sammenligninger analyseklare.
+    # Spørgsmålsbank nr. 1 og 3: disse differencer er selve grundlaget for
+    # MAE-beregningerne. Nr. 1 sammenligner MAE mellem januar og juni, mens
+    # nr. 3 beregner den samme MAE separat for price_area = DK1 og DK2.
+    # Nr. 5 bruger især diff_load_mwh til at vise effekten af ufuldstændige timer.
+    # Differencen er altid realtime minus afregning; MAE bruger abs(diff_*).
     comparison_pairs = {
         "diff_offshore_wind_mwh": ("rt_offshore_wind_mwh", "st_offshore_wind_mwh"),
         "diff_onshore_wind_mwh": ("rt_onshore_wind_mwh", "st_onshore_wind_mwh"),
@@ -480,6 +537,14 @@ def build_realtime_period(period: str) -> tuple[pd.DataFrame, Path]:
 
 
 def run_period(period: str) -> tuple[Path, Path]:
+    """Kør hele perioden og skriv det analyseklare datasæt.
+
+    For spørgsmål 1 og 3 køres funktionen for både ``january`` og ``june``.
+    De to CSV-filer indeholder diff_*-kolonnerne, der bruges til MAE.
+    Spørgsmål 5 bruger desuden ``rt_interval_count``,
+    ``quality_rt_complete_hour`` og ``RT_INCOMPLETE_HOUR`` til at skelne
+    komplette og ufuldstændige timer.
+    """
     realtime_hourly, _ = build_realtime_period(period)
     _, settlement_name = PERIODS[period]
     settlement_raw = load_records(
